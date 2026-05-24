@@ -12,7 +12,8 @@ import {
 import type {
   CompletionItem,
   Position,
-  MarkupContent
+  MarkupContent,
+  TextEdit as LspTextEdit
 } from "vscode-languageserver/node";
 import type { TextEdit } from "vscode-languageserver-types";
 import type { TextDocument } from "vscode-languageserver-textdocument";
@@ -23,6 +24,40 @@ import {
   PRIMITIVE_TYPES,
 } from "./languageFacts.js";
 import { searchWorkspaceSymbols, SK } from "./indexer.js";
+import { VITTE_PACKAGE_IMPORTS } from "./generated/vitteImports.js";
+
+export type CompletionPositionContext =
+  | "code"
+  | "string"
+  | "comment"
+  | "type"
+  | "import";
+
+export interface CompletionSettings {
+  enabledInComments: boolean;
+  enabledInStrings: boolean;
+  includeSnippets: boolean;
+  workspaceSymbols: boolean;
+  maxItems: number;
+}
+
+const DEFAULT_COMPLETION_SETTINGS: CompletionSettings = {
+  enabledInComments: false,
+  enabledInStrings: false,
+  includeSnippets: true,
+  workspaceSymbols: true,
+  maxItems: 200,
+};
+
+let completionSettings: CompletionSettings = { ...DEFAULT_COMPLETION_SETTINGS };
+
+export function configureCompletions(settings?: Partial<CompletionSettings>): void {
+  completionSettings = {
+    ...DEFAULT_COMPLETION_SETTINGS,
+    ...(settings ?? {}),
+    maxItems: clampNumber(settings?.maxItems, 16, 1000, DEFAULT_COMPLETION_SETTINGS.maxItems),
+  };
+}
 
 /* ============================================================================
  * Tables de base
@@ -35,140 +70,7 @@ const COMMON_MEMBERS: readonly { recv: RegExp; members: string[] }[] = [
   { recv: /(map|dict|table)$/i, members: ["len", "get(${1:key})", "set(${1:key}, ${2:val})", "remove(${1:key})", "keys()", "values()"] }
 ];
 
-const VITTE_PACKAGE_IMPORTS: readonly string[] = [
-  "vitte/abi",
-  "vitte/actor",
-  "vitte/alerts",
-  "vitte/alloc",
-  "vitte/arduino",
-  "vitte/array",
-  "vitte/ast",
-  "vitte/async",
-  "vitte/audio",
-  "vitte/audit",
-  "vitte/auth",
-  "vitte/bench",
-  "vitte/benchkit",
-  "vitte/borrow",
-  "vitte/bridge",
-  "vitte/bulkhead",
-  "vitte/cache",
-  "vitte/catalog",
-  "vitte/channel",
-  "vitte/circuit_breaker",
-  "vitte/cli",
-  "vitte/codec",
-  "vitte/codegen",
-  "vitte/collections",
-  "vitte/config",
-  "vitte/config_derive",
-  "vitte/const_eval",
-  "vitte/contracts",
-  "vitte/contracts_registry",
-  "vitte/core",
-  "vitte/crypto",
-  "vitte/data",
-  "vitte/datetime",
-  "vitte/db",
-  "vitte/doc",
-  "vitte/docsgen_modules",
-  "vitte/ecs",
-  "vitte/env",
-  "vitte/eval",
-  "vitte/event_bus",
-  "vitte/feature_flags",
-  "vitte/ffi",
-  "vitte/fixtures",
-  "vitte/fs",
-  "vitte/fuzzkit",
-  "vitte/graph",
-  "vitte/gui",
-  "vitte/hash",
-  "vitte/health",
-  "vitte/hir",
-  "vitte/http",
-  "vitte/http_client",
-  "vitte/idempotency",
-  "vitte/image",
-  "vitte/indexmap",
-  "vitte/io",
-  "vitte/jobs",
-  "vitte/json",
-  "vitte/jsonpath",
-  "vitte/jwt",
-  "vitte/kernel",
-  "vitte/kv",
-  "vitte/lint",
-  "vitte/lock",
-  "vitte/log",
-  "vitte/lru",
-  "vitte/lsp",
-  "vitte/macros",
-  "vitte/math",
-  "vitte/migrate",
-  "vitte/migration_playbook",
-  "vitte/mir",
-  "vitte/ml",
-  "vitte/mock_http",
-  "vitte/module_index",
-  "vitte/monomorphize",
-  "vitte/net",
-  "vitte/observability",
-  "vitte/openapi",
-  "vitte/orm",
-  "vitte/outbox",
-  "vitte/pack",
-  "vitte/pagination",
-  "vitte/pathlib",
-  "vitte/pickle",
-  "vitte/platform",
-  "vitte/plot",
-  "vitte/plugin",
-  "vitte/policy",
-  "vitte/process",
-  "vitte/queue",
-  "vitte/random_secure",
-  "vitte/rate_limit",
-  "vitte/reflect",
-  "vitte/registry",
-  "vitte/release_guard",
-  "vitte/requests",
-  "vitte/retry",
-  "vitte/rope",
-  "vitte/runtime",
-  "vitte/saga",
-  "vitte/scheduler",
-  "vitte/schema_registry",
-  "vitte/search",
-  "vitte/secrets",
-  "vitte/serialize",
-  "vitte/shell",
-  "vitte/slab",
-  "vitte/slo",
-  "vitte/sql",
-  "vitte/stats",
-  "vitte/std",
-  "vitte/stream",
-  "vitte/subprocess",
-  "vitte/sync",
-  "vitte/template",
-  "vitte/tenant",
-  "vitte/test",
-  "vitte/testkit_modules",
-  "vitte/timeout",
-  "vitte/tls",
-  "vitte/trace",
-  "vitte/typeck",
-  "vitte/validation",
-  "vitte/video",
-  "vitte/ws",
-  "vitte/yaml",
-  "vitte/std/base",
-  "vitte/std/data",
-  "vitte/std/io",
-  "vitte/std/async",
-  "vitte/std/net"
-];
+
 
 const BUILTIN_FUNCTIONS: readonly string[] = [
   "print",
@@ -234,20 +136,19 @@ const SNIPPETS: CompletionItem[] = [
     "import ${1:std::core};"),
   ciSnippet("use", "Importe un symbole", "Importe un chemin depuis un module.",
     "use ${1:std/core/types.i32}"),
-  ciSnippet("fn", "Déclare une fonction",
-    "Fonction avec paramètres et type de retour optionnel.",
-    "fn ${1:name}(${2:params})${3: -> ${4:Type}} {\n\t$0\n}"),
   ciSnippet("proc", "Déclare une procédure",
     "Procédure avec paramètres et type de retour optionnel.",
     "proc ${1:name}(${2:params})${3: -> ${4:Type}} {\n\t$0\n}"),
-  ciSnippet("docfn", "Doc + fonction",
-    "Ajoute une docstring puis une fonction.",
-    "/// ${1:Summary}\n///\n/// Params:\n/// - ${2:param}: ${3:description}\n/// Returns: ${4:description}\n/// Example:\n/// ${5:example}\nfn ${6:name}(${7:params})${8: -> ${9:Type}} {\n\t$0\n}"),
+  ciSnippet("fn", "Déclare une fonction (alias)",
+    "Alias de style fonctionnel.",
+    "fn ${1:name}(${2:params})${3: -> ${4:Type}} {\n\t$0\n}"),
   ciSnippet("docproc", "Doc + procédure",
     "Ajoute une docstring puis une procédure.",
     "/// ${1:Summary}\n///\n/// Params:\n/// - ${2:param}: ${3:description}\n/// Returns: ${4:description}\n/// Example:\n/// ${5:example}\nproc ${6:name}(${7:params})${8: -> ${9:Type}} {\n\t$0\n}"),
   ciSnippet("main", "Point d’entrée", "Déclare la fonction principale.",
-    "fn main() {\n\t$0\n}"),
+    "proc main() {\n\t$0\n}"),
+  ciSnippet("test", "Déclare un test", "Déclare un bloc de test.",
+    "test \"${1:name}\" {\n\t$0\n}"),
   ciSnippet("struct", "Déclare une struct", "Structure avec des champs typés.",
     "struct ${1:Name} {\n\t${2:field}: ${3:Type},\n}"),
   ciSnippet("form", "Déclare un form", "Structure avec des champs typés.",
@@ -292,6 +193,9 @@ const SNIPPETS: CompletionItem[] = [
  * ========================================================================== */
 
 interface ExtractedSym { name: string; kind: SymbolKind; }
+interface ScopedName { name: string; kind: SymbolKind; signature?: string; }
+interface DeclFunction { name: string; params: string; returnType?: string; }
+type InferredType = "bool" | "string" | "number" | "unknown" | string;
 
 function extractSymbols(doc: TextDocument): ExtractedSym[] {
   const text = doc.getText();
@@ -374,6 +278,143 @@ function currentToken(doc: TextDocument, pos: Position): { token: string; range:
   };
 }
 
+function detectPositionContext(doc: TextDocument, pos: Position): CompletionPositionContext {
+  const text = doc.getText();
+  const cursor = doc.offsetAt(pos);
+  const limit = Math.min(Math.max(0, cursor), text.length);
+  let i = 0;
+
+  let inLineComment = false;
+  let inBlockComment = false;
+  let inZoneComment = false;
+  let inString = false;
+  let quote = "";
+  let inRawString = false;
+  let rawStringHashes = 0;
+  let inTripleString = false;
+
+  while (i < limit) {
+    const ch = text[i] ?? "";
+    const next = text[i + 1] ?? "";
+
+    if (inLineComment) {
+      if (ch === "\n") inLineComment = false;
+      i++;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        inBlockComment = false;
+        i += 2;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (inZoneComment) {
+      if (ch === ">" && next === ">" && text[i + 2] === ">") {
+        inZoneComment = false;
+        i += 3;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (inTripleString) {
+      if (ch === "\"" && next === "\"" && text[i + 2] === "\"") {
+        inTripleString = false;
+        i += 3;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (inRawString) {
+      if (ch === "\"") {
+        let j = i + 1;
+        let ok = true;
+        for (let h = 0; h < rawStringHashes; h++) {
+          if (text[j + h] !== "#") {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
+          inRawString = false;
+          i = j + rawStringHashes;
+          continue;
+        }
+      }
+      i++;
+      continue;
+    }
+    if (inString) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === quote) {
+        inString = false;
+        quote = "";
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === "#" && next !== "[") {
+      inLineComment = true;
+      i++;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      inLineComment = true;
+      i += 2;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      inBlockComment = true;
+      i += 2;
+      continue;
+    }
+    if (ch === "<" && next === "<" && text[i + 2] === "<") {
+      inZoneComment = true;
+      i += 3;
+      continue;
+    }
+    if (ch === "\"" && next === "\"" && text[i + 2] === "\"") {
+      inTripleString = true;
+      i += 3;
+      continue;
+    }
+    if (ch === "r") {
+      let j = i + 1;
+      while (text[j] === "#") j++;
+      if (text[j] === "\"") {
+        inRawString = true;
+        rawStringHashes = j - (i + 1);
+        i = j + 1;
+        continue;
+      }
+    }
+    if (ch === "\"" || ch === "'") {
+      inString = true;
+      quote = ch;
+      i++;
+      continue;
+    }
+    i++;
+  }
+
+  if (inLineComment || inBlockComment) return "comment";
+  if (inString) return "string";
+
+  const linePrefix = getLinePrefix(doc, pos);
+  if (/^\s*(?:import|use|pull)\s+/.test(linePrefix)) return "import";
+  if (/:\s*[A-Za-z_0-9<>&[\]|?:.,\s]*$/.test(linePrefix)) return "type";
+  if (/\b(?:as|is|impl|dyn)\s+[A-Za-z_0-9<>&[\]|?:.,\s]*$/.test(linePrefix)) return "type";
+  return "code";
+}
+
 function fuzzyScore(candidate: string, query: string): number {
   if (!query) return 1;
   if (candidate.startsWith(query)) return 2; // boost prefix strict
@@ -382,6 +423,307 @@ function fuzzyScore(candidate: string, query: string): number {
     if (candidate[i].toLowerCase() === query[qi].toLowerCase()) qi++;
   }
   return 0.5 + qi / (2 * Math.max(1, query.length));
+}
+
+function isWordBoundary(ch: string | undefined): boolean {
+  if (!ch) return true;
+  return !/[A-Za-z0-9_]/.test(ch);
+}
+
+function extractScopedNames(doc: TextDocument, pos: Position): ScopedName[] {
+  const text = doc.getText();
+  const cursor = doc.offsetAt(pos);
+  const head = text.slice(0, cursor);
+
+  const out: ScopedName[] = [];
+  const seen = new Set<string>();
+
+  const letLike = /\b(?:let|const|static|share)\s+([A-Za-z_]\w*)/g;
+  let m: RegExpExecArray | null;
+  while ((m = letLike.exec(head))) {
+    const name = m[1];
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push({
+      name,
+      kind: m[0].startsWith("const") ? SymbolKind.Constant : SymbolKind.Variable,
+    });
+  }
+
+  const params = /\b(?:proc|fn)\s+[A-Za-z_]\w*\s*\(([^)]*)\)/g;
+  while ((m = params.exec(head))) {
+    const plist = m[1];
+    for (const raw of plist.split(",")) {
+      const part = raw.trim();
+      if (!part) continue;
+      const pm = /^([A-Za-z_]\w*)/.exec(part);
+      if (!pm) continue;
+      const name = pm[1];
+      if (seen.has(name)) continue;
+      seen.add(name);
+      out.push({ name, kind: SymbolKind.Variable });
+    }
+  }
+
+  return out;
+}
+
+function extractDeclaredFunctions(doc: TextDocument): DeclFunction[] {
+  const text = doc.getText();
+  const rx = /\b(?:pub\s+)?(?:fn|proc)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?:->\s*([A-Za-z_][\w<>\[\]|?:./]*))?/g;
+  const out: DeclFunction[] = [];
+  const seen = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(text))) {
+    const name = m[1];
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push({
+      name,
+      params: (m[2] ?? "").trim(),
+      returnType: m[3]?.trim() || undefined,
+    });
+    if (m[0].length === 0) rx.lastIndex++;
+  }
+  return out;
+}
+
+function addScopedCompletionItems(items: CompletionItem[], scoped: ScopedName[], token: string, range: Range): void {
+  for (const s of scoped) {
+    if (fuzzyScore(s.name, token) <= 0) continue;
+    items.push({
+      label: s.name,
+      kind: mapSymbolKindToCompletionKind(s.kind),
+      detail: "Scope local",
+      documentation: md(`Nom local en scope: \`${s.name}\`.`),
+      sortText: tier(0, `scope:${s.name}`),
+      filterText: s.name,
+      textEdit: edit(range, s.name),
+      commitCharacters: DEFAULT_COMMIT_CHARS,
+      labelDetails: { description: "local" },
+      data: { source: "scope", name: s.name },
+    });
+  }
+}
+
+function addFunctionCompletionItems(items: CompletionItem[], funcs: DeclFunction[], token: string, range: Range): void {
+  for (const fn of funcs) {
+    if (fuzzyScore(fn.name, token) <= 0) continue;
+    const signature = `${fn.name}(${fn.params})${fn.returnType ? ` -> ${fn.returnType}` : ""}`;
+    items.push({
+      label: fn.name,
+      kind: CompletionItemKind.Function,
+      detail: signature,
+      documentation: md(`Fonction/proc déclarée: \`${signature}\`.`),
+      sortText: tier(1, `filefn:${fn.name}`),
+      filterText: fn.name,
+      textEdit: edit(range, fn.name),
+      insertText: `${fn.name}($0)`,
+      insertTextFormat: InsertTextFormat.Snippet,
+      commitCharacters: DEFAULT_COMMIT_CHARS,
+      labelDetails: { description: "file function" },
+      data: { source: "file-fn", signature },
+    });
+  }
+}
+
+function inferLocalTypes(doc: TextDocument, pos: Position): Map<string, InferredType> {
+  const text = doc.getText().slice(0, doc.offsetAt(pos));
+  const out = new Map<string, InferredType>();
+  const rx = /\b(?:let|const|static)\s+([A-Za-z_]\w*)(?:\s*:\s*([A-Za-z_][\w<>[\]|?:./]*))?(?:\s*=\s*([^;\n]+))?/g;
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(text))) {
+    const name = m[1];
+    const explicitTy = m[2]?.trim();
+    const value = (m[3] ?? "").trim();
+    if (explicitTy) {
+      out.set(name, explicitTy);
+      continue;
+    }
+    if (/^(true|false)\b/.test(value)) out.set(name, "bool");
+    else if (/^["']/.test(value)) out.set(name, "string");
+    else if (/^-?\d+(\.\d+)?\b/.test(value)) out.set(name, "number");
+    else out.set(name, "unknown");
+    if (m[0].length === 0) rx.lastIndex++;
+  }
+  return out;
+}
+
+function nonNullVariablesInScope(doc: TextDocument, pos: Position): Set<string> {
+  const text = doc.getText().slice(0, doc.offsetAt(pos));
+  const out = new Set<string>();
+  const checks = [
+    /\bif\s+([A-Za-z_]\w*)\s*!=\s*(?:null|nil)\b/g,
+    /\bif\s+(?:null|nil)\s*!=\s*([A-Za-z_]\w*)\b/g,
+    /\bif\s+([A-Za-z_]\w*)\s+is\s+not\s+null\b/g,
+    /\bif\s+([A-Za-z_]\w*)\s+is\s+not\s+nil\b/g,
+  ];
+  for (const rx of checks) {
+    let m: RegExpExecArray | null;
+    while ((m = rx.exec(text))) {
+      out.add(m[1]);
+      if (m[0].length === 0) rx.lastIndex++;
+    }
+  }
+  return out;
+}
+
+function expectedTypeAtPosition(doc: TextDocument, pos: Position): InferredType {
+  const prefix = getLinePrefix(doc, pos);
+  if (/=\s*$/.test(prefix)) {
+    const m = /\b(?:let|const|static)\s+[A-Za-z_]\w*\s*:\s*([A-Za-z_][\w<>[\]|?:./]*)\s*=\s*$/.exec(prefix);
+    if (m?.[1]) return m[1].trim();
+  }
+  if (/\bif\s+[^\n]*$/.test(prefix) || /\bwhile\s+[^\n]*$/.test(prefix)) return "bool";
+  if (/:?\s*string\s*=\s*$/.test(prefix)) return "string";
+  return "unknown";
+}
+
+function addExpectedValueCompletions(items: CompletionItem[], expected: InferredType, range: Range): void {
+  if (expected === "bool") {
+    for (const lit of ["true", "false"]) {
+      items.push({
+        label: lit,
+        kind: CompletionItemKind.Value,
+        detail: "Valeur attendue: bool",
+        sortText: tier(0, `expected:${lit}`),
+        filterText: lit,
+        textEdit: edit(range, lit),
+        commitCharacters: DEFAULT_COMMIT_CHARS,
+        data: { source: "expected", expected: "bool" },
+      });
+    }
+    return;
+  }
+  if (expected === "string") {
+    items.push({
+      label: "\"\"",
+      kind: CompletionItemKind.Value,
+      detail: "Valeur attendue: string",
+      insertText: "\"$0\"",
+      insertTextFormat: InsertTextFormat.Snippet,
+      sortText: tier(0, "expected:string"),
+      filterText: "\"\"",
+      textEdit: edit(range, "\"\""),
+      commitCharacters: DEFAULT_COMMIT_CHARS,
+      data: { source: "expected", expected: "string" },
+    });
+  }
+}
+
+function addFlowSensitiveMemberCompletions(
+  items: CompletionItem[],
+  doc: TextDocument,
+  pos: Position,
+  localTypes: Map<string, InferredType>,
+  nonNullVars: Set<string>,
+): void {
+  const linePrefix = getLinePrefix(doc, pos);
+  const recvMatch = /([A-Za-z_]\w*)\.\s*$/.exec(linePrefix);
+  if (!recvMatch) return;
+  const recv = recvMatch[1];
+  if (!nonNullVars.has(recv)) return;
+  const ty = localTypes.get(recv) ?? "unknown";
+  const members = ty === "string"
+    ? ["len()", "trim()", "to_upper()", "to_lower()", "slice(${1:start}, ${2:end})"]
+    : ty === "bool"
+      ? ["to_string()"]
+      : ["len()", "is_empty()", "to_string()"];
+  for (const m of members) {
+    items.push({
+      label: m,
+      kind: CompletionItemKind.Method,
+      detail: `Flow-safe member (${recv} non-null)`,
+      insertText: m,
+      insertTextFormat: /[\$\{]/.test(m) ? InsertTextFormat.Snippet : InsertTextFormat.PlainText,
+      sortText: tier(0, `flow:${recv}:${m}`),
+      commitCharacters: DEFAULT_COMMIT_CHARS,
+      data: { source: "flow", receiver: recv, inferredType: ty },
+    });
+  }
+}
+
+function addPostErrorRecoveryCompletions(items: CompletionItem[], doc: TextDocument, pos: Position): void {
+  const text = doc.getText().slice(0, doc.offsetAt(pos));
+  const opens = (text.match(/{/g) ?? []).length;
+  const closes = (text.match(/}/g) ?? []).length;
+  if (opens > closes) {
+    items.push({
+      label: "}",
+      kind: CompletionItemKind.Text,
+      detail: "Récupération syntaxe",
+      documentation: md("Fermer le bloc courant."),
+      sortText: tier(0, "recover:block-close"),
+      insertText: "}",
+      commitCharacters: DEFAULT_COMMIT_CHARS,
+      data: { source: "recovery", kind: "brace" },
+    });
+  }
+  const linePrefix = getLinePrefix(doc, pos);
+  if (/^\s*(if|for|while|match)\b[^{\n]*$/.test(linePrefix)) {
+    items.push({
+      label: "{ ... }",
+      kind: CompletionItemKind.Snippet,
+      detail: "Récupération syntaxe",
+      insertText: " {\n\t$0\n}",
+      insertTextFormat: InsertTextFormat.Snippet,
+      sortText: tier(0, "recover:block-body"),
+      commitCharacters: DEFAULT_COMMIT_CHARS,
+      data: { source: "recovery", kind: "body" },
+    });
+  }
+}
+
+function addRepoFrequentApiCompletions(items: CompletionItem[], token: string, range: Range): void {
+  const frequentApis = [
+    "len", "push", "pop", "clear", "iter",
+    "println", "assert", "panic",
+    "map", "filter", "reduce",
+  ];
+  for (const api of frequentApis) {
+    if (fuzzyScore(api, token) <= 0) continue;
+    items.push({
+      label: api,
+      kind: CompletionItemKind.Function,
+      detail: "API fréquente (repo)",
+      sortText: tier(2, `freq:${api}`),
+      filterText: api,
+      textEdit: edit(range, api),
+      commitCharacters: DEFAULT_COMMIT_CHARS,
+      data: { source: "repo-frequent", api },
+    });
+  }
+}
+
+function hasPathImport(doc: TextDocument, pathValue: string): boolean {
+  const text = doc.getText();
+  const lineRx = new RegExp(`^\\s*(?:use|pull|import)\\s+${escapeRegex(pathValue)}\\b`, "m");
+  return lineRx.test(text);
+}
+
+function buildAutoImportEdit(doc: TextDocument, pathValue: string): LspTextEdit[] | undefined {
+  if (!pathValue || hasPathImport(doc, pathValue)) return undefined;
+  const lines = doc.getText().split(/\r?\n/);
+  let insertLine = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    if (/^\s*(space|module)\b/.test(line)) {
+      insertLine = i + 1;
+      continue;
+    }
+    if (/^\s*(use|pull|import)\b/.test(line)) {
+      insertLine = i + 1;
+      continue;
+    }
+    if (line.trim() !== "") break;
+  }
+  return [{
+    range: Range.create(
+      { line: insertLine, character: 0 },
+      { line: insertLine, character: 0 }
+    ),
+    newText: `use ${pathValue}\n`,
+  }];
 }
 
 /* ============================================================================
@@ -407,7 +749,10 @@ function diagnosticsCompletion(linePrefix: string): CompletionItem[] {
         kind: CompletionItemKind.Module,
         detail: "Import rapide",
         documentation: md(`Ajoute l'import \`${imp}\`.`),
-        sortText: tier(0, imp)
+        sortText: tier(3, imp),
+        filterText: imp,
+        commitCharacters: DEFAULT_COMMIT_CHARS,
+        data: { source: "stdlib-import", modulePath: imp }
       });
     }
   }
@@ -489,12 +834,19 @@ function workspaceSymbolCompletions(
       kind,
       detail: detailParts.join(" — "),
       documentation: md(`Symbole workspace \`${sym.name}\`.`),
-      sortText: tier(context === "import" ? 0 : 1, `ws:${sym.name}`),
+      sortText: tier(context === "import" ? 2 : 2, `ws:${sym.name}`),
       filterText: sym.name,
       textEdit: edit(range, sym.name),
+      additionalTextEdits: context === "general" ? buildAutoImportEdit(doc, sym.name) : undefined,
+      commitCharacters: DEFAULT_COMMIT_CHARS,
       labelDetails: context === "import"
         ? { detail: "workspace" }
-        : { description: SYMBOL_KIND_LABEL[sym.kind] ?? "symbol" }
+        : { description: SYMBOL_KIND_LABEL[sym.kind] ?? "project symbol" },
+      data: {
+        source: "workspace",
+        modulePath: sym.name,
+        uri: sym.uri,
+      },
     });
     if (context === "general" && items.length >= 40) break;
     if (context === "import" && items.length >= 60) break;
@@ -531,6 +883,15 @@ export function provideCompletions(doc: TextDocument, position: Position): Compl
   const items: CompletionItem[] = [];
   const { token, range } = currentToken(doc, position);
   const linePrefix = getLinePrefix(doc, position);
+  const context = detectPositionContext(doc, position);
+  const localScoped = extractScopedNames(doc, position);
+  const declaredFunctions = extractDeclaredFunctions(doc);
+  const localTypes = inferLocalTypes(doc, position);
+  const nonNullVars = nonNullVariablesInScope(doc, position);
+  const expectedType = expectedTypeAtPosition(doc, position);
+
+  if (context === "comment" && !completionSettings.enabledInComments) return [];
+  if (context === "string" && !completionSettings.enabledInStrings) return [];
 
   // Mots-clés
   for (const kw of KEYWORDS) {
@@ -544,8 +905,8 @@ export function provideCompletions(doc: TextDocument, position: Position): Compl
         sortText: tier(2 - (score >= 2 ? 1 : 0), kw),
         filterText: kw,
         textEdit: edit(range, kw),
-        preselect: kw === "fn" || kw === "let",
-        commitCharacters: [" ", "\t", "(", ")", "{", "}", "[", "]", ";", ",", "."],
+        preselect: kw === "proc" || kw === "let",
+        commitCharacters: DEFAULT_COMMIT_CHARS,
         labelDetails: { description: "keyword" }
       });
     }
@@ -561,6 +922,7 @@ export function provideCompletions(doc: TextDocument, position: Position): Compl
         documentation: md(`Littéral \`${lit}\`.`),
         sortText: tier(2, `~${lit}`),
         textEdit: edit(range, lit),
+        commitCharacters: DEFAULT_COMMIT_CHARS,
         labelDetails: { description: "literal" }
       });
     }
@@ -576,6 +938,7 @@ export function provideCompletions(doc: TextDocument, position: Position): Compl
         documentation: md(`Type primitif \`${ty}\`.`),
         sortText: tier(2, `type:${ty}`),
         textEdit: edit(range, ty),
+        commitCharacters: DEFAULT_COMMIT_CHARS,
         labelDetails: { description: "type" }
       });
     }
@@ -591,18 +954,35 @@ export function provideCompletions(doc: TextDocument, position: Position): Compl
         documentation: md(`Fonction builtin \`${fn}\`.`),
         sortText: tier(2, `builtin:${fn}`),
         textEdit: edit(range, fn),
+        commitCharacters: DEFAULT_COMMIT_CHARS,
         labelDetails: { description: "builtin" }
       });
     }
   }
 
+  // Scope local (priorité max)
+  addScopedCompletionItems(items, localScoped, token, range);
+
+  // Fonctions déclarées dans le fichier
+  addFunctionCompletionItems(items, declaredFunctions, token, range);
+
+  // Valeurs attendues (bool/string/minimal typing)
+  addExpectedValueCompletions(items, expectedType, range);
+
+  // APIs fréquentes observées dans le repo
+  addRepoFrequentApiCompletions(items, token, range);
+
   // Snippets
-  for (const it of SNIPPETS) {
-    items.push({
-      ...it,
-      sortText: tier(3, it.label),
-      filterText: it.label
-    });
+  if (completionSettings.includeSnippets && context !== "string" && context !== "comment") {
+    for (const it of SNIPPETS) {
+      items.push({
+        ...it,
+        sortText: tier(4, String(it.label)),
+        filterText: String(it.label),
+        commitCharacters: DEFAULT_COMMIT_CHARS,
+        data: { source: "snippet", label: it.label }
+      });
+    }
   }
 
   // Symboles du document
@@ -617,13 +997,17 @@ export function provideCompletions(doc: TextDocument, position: Position): Compl
         sortText: tier(1, label),
         filterText: label,
         textEdit: edit(range, label),
+        commitCharacters: DEFAULT_COMMIT_CHARS,
         labelDetails: { description: SYMBOL_KIND_LABEL[s.kind] ?? "symbol" }
       });
     }
   }
 
   // Contexte: membres après un point
-  items.push(...memberCompletion(linePrefix));
+  if (context !== "type") {
+    items.push(...memberCompletion(linePrefix));
+    addFlowSensitiveMemberCompletions(items, doc, position, localTypes, nonNullVars);
+  }
 
   // Contexte: import et autres heuristiques
   const isImportContext = /^\s*(?:import|use|pull)\s+/.test(linePrefix);
@@ -631,27 +1015,48 @@ export function provideCompletions(doc: TextDocument, position: Position): Compl
   items.push(...diagnosticsCompletion(linePrefix).map(ci => ({
     ...ci,
     textEdit: ci.insertText ? undefined : edit(range, ci.label),
-    sortText: ci.sortText ?? tier(0, ci.label)
+    sortText: ci.sortText ?? tier(3, ci.label),
+    commitCharacters: ci.commitCharacters ?? DEFAULT_COMMIT_CHARS,
   })));
 
-  if (isImportContext) {
-    items.push(...workspaceSymbolCompletions(doc, token, range, "import"));
-  } else if (token.length >= 2) {
-    items.push(...workspaceSymbolCompletions(doc, token, range, "general"));
+  // Suggestions de récupération quand le code est incomplet/cassé.
+  addPostErrorRecoveryCompletions(items, doc, position);
+
+  if (completionSettings.workspaceSymbols) {
+    if (isImportContext) {
+      items.push(...workspaceSymbolCompletions(doc, token, range, "import"));
+    } else if (token.length >= 2) {
+      items.push(...workspaceSymbolCompletions(doc, token, range, "general"));
+    }
   }
 
-  return dedupe(items, it => `${it.label}|${it.kind}|${it.sortText ?? ""}`);
+  return dedupe(items, it => `${it.label}|${it.kind}|${it.sortText ?? ""}`)
+    .slice(0, completionSettings.maxItems);
 }
 
 export function resolveCompletion(item: CompletionItem): CompletionItem {
+  const data = (item.data && typeof item.data === "object") ? item.data as Record<string, unknown> : undefined;
   if (!item.documentation && typeof item.label === "string") {
     item.documentation = md(`Entrée de complétion \`${item.label}\`.`);
+  }
+  if (data?.source === "workspace" && typeof data.modulePath === "string") {
+    item.documentation = md(
+      `Symbole projet: \`${data.modulePath}\`\n\n` +
+      `Import auto: \`use ${data.modulePath}\` (si absent).`
+    );
+  } else if (data?.source === "file-fn" && typeof data.signature === "string") {
+    item.documentation = md(`Signature: \`${data.signature}\``);
+  } else if (data?.source === "scope" && typeof data.name === "string") {
+    item.documentation = md(`Variable/const locale: \`${data.name}\`.`);
+  } else if (data?.source === "stdlib-import" && typeof data.modulePath === "string") {
+    item.documentation = md(`Module stdlib: \`${data.modulePath}\``);
   }
   return item;
 }
 
 export function triggerCharacters(): string[] {
-  return [".", ":", ">", "=", " ", "(", "[", "{", "\"", "'"];
+  const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_".split("");
+  return [".", ":", ">", "=", " ", "(", "[", "{", "\"", "'", ...letters];
 }
 
 /* ============================================================================
@@ -692,4 +1097,15 @@ function dedupe<T>(arr: T[], key: (t: T) => string): T[] {
     out.push(el);
   }
   return out;
+}
+
+const DEFAULT_COMMIT_CHARS = [" ", "\t", "(", ")", "{", "}", "[", "]", ";", ",", "."];
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function clampNumber(value: number | undefined, min: number, max: number, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(value)));
 }

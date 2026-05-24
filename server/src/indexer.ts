@@ -80,6 +80,7 @@ const DECLARATIONS = new Map<string, DeclarationInfo>([
   ["form", { kind: SK.Struct, expectBody: true }],
   ["enum", { kind: SK.Enum, expectBody: true }],
   ["union", { kind: SK.Struct, expectBody: true }],
+  ["trait", { kind: SK.Interface, expectBody: true }],
   ["type", { kind: SK.Interface, expectBody: false }],
   ["fn", { kind: SK.Function, expectBody: true, allowBodyless: true }],
   ["proc", { kind: SK.Function, expectBody: true, allowBodyless: true }],
@@ -87,7 +88,7 @@ const DECLARATIONS = new Map<string, DeclarationInfo>([
   ["static", { kind: SK.Variable, expectBody: false }],
 ]);
 
-const MODIFIERS = new Set(["pub"]);
+const MODIFIERS = new Set(["pub", "export"]);
 
 class SymbolParser {
   private readonly text: string;
@@ -216,6 +217,7 @@ class SymbolParser {
       case "enum":
       case "union":
       case "type":
+      case "trait":
         this.skipTrivia();
         return this.readIdentifierToken();
       case "fn":

@@ -56,7 +56,8 @@
           "Vit"
         ],
         "extensions": [
-          ".vit"
+          ".vit",
+          ".vitl"
         ],
         "configuration": "./language-configuration.json"
       }
@@ -179,6 +180,41 @@
         "category": "Vitte"
       },
       {
+        "command": "vitte.inline.nextSuggestion",
+        "title": "Vitte: Inline Next Suggestion",
+        "category": "Vitte"
+      },
+      {
+        "command": "vitte.inline.nextEdit",
+        "title": "Vitte: Inline Next Edit",
+        "category": "Vitte"
+      },
+      {
+        "command": "vitte.inline.toggle",
+        "title": "Vitte: Inline Toggle",
+        "category": "Vitte"
+      },
+      {
+        "command": "vitte.suggestions.refreshContext",
+        "title": "Vitte: Suggestions Refresh Context",
+        "category": "Vitte"
+      },
+      {
+        "command": "vitte.suggestions.cloudOptIn",
+        "title": "Vitte: Suggestions Cloud Opt-In",
+        "category": "Vitte"
+      },
+      {
+        "command": "vitte.suggestions.cloudOptOut",
+        "title": "Vitte: Suggestions Cloud Opt-Out (Local-Only)",
+        "category": "Vitte"
+      },
+      {
+        "command": "editor.action.inlineSuggest.trigger",
+        "title": "Vitte: Trigger Inline Suggestion",
+        "category": "Vitte"
+      },
+      {
         "command": "vitte.suggestions.resetLearning",
         "title": "Vitte: Suggestions Reset Learning",
         "category": "Vitte"
@@ -191,6 +227,16 @@
       {
         "command": "vitte.suggestions.openProfiler",
         "title": "Vitte: Suggestions Open Profiler",
+        "category": "Vitte"
+      },
+      {
+        "command": "vitte.suggestions.showLocalEngineStats",
+        "title": "Vitte: Suggestions Show Local Engine Stats",
+        "category": "Vitte"
+      },
+      {
+        "command": "vitte.suggestions.profileResources",
+        "title": "Vitte: Suggestions Profile Resources",
         "category": "Vitte"
       },
       {
@@ -925,6 +971,26 @@
         "command": "vitte.suggestions.loadNextPage",
         "key": "ctrl+alt+.",
         "when": "editorTextFocus && suggestWidgetVisible && (editorLangId == vitte || editorLangId == vit)"
+      },
+      {
+        "command": "vitte.inline.nextSuggestion",
+        "key": "alt+]",
+        "when": "editorTextFocus && (editorLangId == vitte || editorLangId == vit)"
+      },
+      {
+        "command": "vitte.inline.nextEdit",
+        "key": "alt+shift+]",
+        "when": "editorTextFocus && (editorLangId == vitte || editorLangId == vit)"
+      },
+      {
+        "command": "editor.action.inlineSuggest.acceptNextWord",
+        "key": "ctrl+right",
+        "when": "inlineSuggestionVisible && editorTextFocus && (editorLangId == vitte || editorLangId == vit)"
+      },
+      {
+        "command": "editor.action.inlineSuggest.hide",
+        "key": "escape",
+        "when": "inlineSuggestionVisible && editorTextFocus && (editorLangId == vitte || editorLangId == vit)"
       }
     ],
     "taskDefinitions": [
@@ -1175,6 +1241,33 @@
           "type": "boolean",
           "default": true,
           "description": "Enable completion provider."
+        },
+        "vitte.completion.enabledInComments": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable completion suggestions when cursor is in a comment."
+        },
+        "vitte.completion.enabledInStrings": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable completion suggestions when cursor is in a string literal."
+        },
+        "vitte.completion.includeSnippets": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include snippet completions in completion results."
+        },
+        "vitte.completion.workspaceSymbols": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include multi-file workspace symbols in completion results."
+        },
+        "vitte.completion.maxItems": {
+          "type": "number",
+          "default": 200,
+          "minimum": 16,
+          "maximum": 1000,
+          "description": "Maximum number of completion items returned per request."
         },
         "vitte.suggestions.adaptiveRanking": {
           "type": "boolean",
@@ -1549,6 +1642,258 @@
           "minimum": 200,
           "maximum": 10000,
           "description": "Maximum age (ms) of a stable top-1 candidate kept for ghost text preview."
+        },
+        "vitte.suggestions.inlineCacheTtlMs": {
+          "type": "number",
+          "default": 150,
+          "minimum": 50,
+          "maximum": 1000,
+          "description": "Inline completion cache TTL (ms). Target hot-path latency under 150ms."
+        },
+        "vitte.suggestions.localEngine.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable local repo-only n-gram/pattern inline engine (no external backend)."
+        },
+        "vitte.suggestions.localEngine.maxFiles": {
+          "type": "number",
+          "default": 6000,
+          "minimum": 50,
+          "maximum": 50000,
+          "description": "Maximum number of workspace source files indexed by the local inline engine."
+        },
+        "vitte.suggestions.localEngine.maxFileSizeKB": {
+          "type": "number",
+          "default": 256,
+          "minimum": 16,
+          "maximum": 8192,
+          "description": "Per-file size cap (KB) for local inline indexing."
+        },
+        "vitte.suggestions.localEngine.reindexDebounceMs": {
+          "type": "number",
+          "default": 120,
+          "minimum": 25,
+          "maximum": 3000,
+          "description": "Debounce delay (ms) for incremental local index updates while typing."
+        },
+        "vitte.suggestions.localEngine.inlineTopK": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 24,
+          "description": "Maximum number of local engine inline candidates evaluated per cursor request."
+        },
+        "vitte.suggestions.localEngine.persistIndex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Persist local inline index to disk and reload it on startup."
+        },
+        "vitte.suggestions.localEngine.expectedValueHints": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable expected-value inline hints (bool/string/number/enum-like) from local context."
+        },
+        "vitte.suggestions.localEngine.errorRecoveryHints": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable recovery inline hints for incomplete code (missing ), ], })."
+        },
+        "vitte.suggestions.localEngine.multilineEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable multi-line inline generation from local beam search + learned block patterns."
+        },
+        "vitte.suggestions.localEngine.beamWidth": {
+          "type": "number",
+          "default": 6,
+          "minimum": 2,
+          "maximum": 16,
+          "description": "Beam width for local token generation (higher = richer but slower)."
+        },
+        "vitte.suggestions.localEngine.maxGeneratedTokens": {
+          "type": "number",
+          "default": 24,
+          "minimum": 4,
+          "maximum": 64,
+          "description": "Maximum generated tokens for local multi-line continuations."
+        },
+        "vitte.suggestions.localEngine.apiChainHints": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable learned API chain continuations (e.g., .map().filter().collect()) from repo usage."
+        },
+        "vitte.suggestions.localEngine.adaptiveLearning": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable persistent local reranking from accepted inline suggestions by context."
+        },
+        "vitte.suggestions.localEngine.contextClassifierEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable local context classifier (declaration/call/member/guard/return/test) for strategy-specific ranking."
+        },
+        "vitte.suggestions.localEngine.fastCacheEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable ultra-fast local LRU cache for hot inline contexts."
+        },
+        "vitte.suggestions.localEngine.fastCacheSize": {
+          "type": "number",
+          "default": 512,
+          "minimum": 32,
+          "maximum": 4096,
+          "description": "LRU entry count for local inline hot-context cache."
+        },
+        "vitte.suggestions.localEngine.fastCacheTtlMs": {
+          "type": "number",
+          "default": 400,
+          "minimum": 20,
+          "maximum": 5000,
+          "description": "TTL in milliseconds for local inline hot-context cache entries."
+        },
+        "vitte.suggestions.aiPipeline.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable advanced inline AI pipeline (RAG context + reranking + anti-hallucination) with local fallback."
+        },
+        "vitte.suggestions.aiPipeline.backendEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable dedicated LLM backend calls for inline suggestions."
+        },
+        "vitte.suggestions.aiPipeline.backendUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Dedicated LLM endpoint URL for inline completion candidates."
+        },
+        "vitte.suggestions.aiPipeline.backendTimeoutMs": {
+          "type": "number",
+          "default": 800,
+          "minimum": 100,
+          "maximum": 10000,
+          "description": "Timeout budget (ms) for dedicated LLM backend inline calls."
+        },
+        "vitte.suggestions.aiPipeline.ragTopK": {
+          "type": "number",
+          "default": 6,
+          "minimum": 1,
+          "maximum": 24,
+          "description": "Top-k local repository chunks selected for prompt context (RAG)."
+        },
+        "vitte.suggestions.aiPipeline.maxCandidates": {
+          "type": "number",
+          "default": 6,
+          "minimum": 1,
+          "maximum": 16,
+          "description": "Maximum inline candidates kept after dedupe + scoring."
+        },
+        "vitte.suggestions.aiPipeline.antiHallucination": {
+          "type": "boolean",
+          "default": true,
+          "description": "Apply anti-hallucination filtering (prefer known repository symbols)."
+        },
+        "vitte.suggestions.aiPipeline.allowUnknownSymbols": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow candidates containing unknown identifiers when anti-hallucination is enabled."
+        },
+        "vitte.suggestions.aiPipeline.styleMode": {
+          "type": "string",
+          "enum": [
+            "project",
+            "user"
+          ],
+          "default": "project",
+          "description": "Style adaptation basis for AI pipeline ranking."
+        },
+        "vitte.suggestions.aiPipeline.userMode": {
+          "type": "string",
+          "enum": [
+            "aggressive",
+            "balanced",
+            "conservative"
+          ],
+          "default": "balanced",
+          "description": "Per-user suggestion behavior profile."
+        },
+        "vitte.suggestions.aiPipeline.privacyStrict": {
+          "type": "boolean",
+          "default": true,
+          "description": "Strict privacy mode: backend usage requires explicit allowlist match."
+        },
+        "vitte.suggestions.aiPipeline.backendAllowlist": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Allowed backend hostnames/domains when privacyStrict is enabled."
+        },
+        "vitte.suggestions.aiPipeline.redactSecrets": {
+          "type": "boolean",
+          "default": true,
+          "description": "Redact likely secrets/tokens before sending context to backend."
+        },
+        "vitte.suggestions.aiPipeline.trustedWorkspaceOnly": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow backend inline requests only in trusted VS Code workspaces."
+        },
+        "vitte.suggestions.aiPipeline.cloudOptIn": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicit consent to send code context to cloud backend."
+        },
+        "vitte.suggestions.aiPipeline.localOnly": {
+          "type": "boolean",
+          "default": true,
+          "description": "Force local-only suggestions (disables remote backend calls)."
+        },
+        "vitte.suggestions.aiPipeline.dataRetentionDays": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 3650,
+          "description": "Declared data retention policy sent to backend (days). 0 = no retention requested."
+        },
+        "vitte.suggestions.aiPipeline.allowExternalTraining": {
+          "type": "boolean",
+          "default": false,
+          "description": "Declare whether backend may use prompts/snippets for external model training."
+        },
+        "vitte.suggestions.aiPipeline.useWorkerIndexing": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use dedicated worker thread for AI pipeline chunk parsing/indexing."
+        },
+        "vitte.suggestions.aiPipeline.promptCacheEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable prompt/RAG chunk cache for repeated nearby contexts."
+        },
+        "vitte.suggestions.aiPipeline.promptCacheTtlMs": {
+          "type": "number",
+          "default": 400,
+          "minimum": 20,
+          "maximum": 5000,
+          "description": "Prompt cache TTL (ms) for AI pipeline context retrieval."
+        },
+        "vitte.suggestions.aiPipeline.promptCacheSize": {
+          "type": "number",
+          "default": 512,
+          "minimum": 16,
+          "maximum": 4096,
+          "description": "Prompt cache size for AI pipeline hot contexts."
+        },
+        "vitte.suggestions.granularity": {
+          "type": "string",
+          "enum": [
+            "classic_only",
+            "inline_only",
+            "hybrid"
+          ],
+          "default": "hybrid",
+          "description": "Suggestions mode granularity: classic completions only, inline only, or hybrid."
         },
         "vitte.features.hover": {
           "type": "boolean",
@@ -1990,7 +2335,7 @@
     }
   },
   "scripts": {
-    "build": "npm run build:client && npm run build:server && npm run build:servercopy",
+    "build": "npm run generate:imports && npm run build:client && npm run build:server && npm run build:servercopy",
     "build:client": "tsc -p ./",
     "build:server": "tsc -p server",
     "build:servercopy": "mkdir -p out server/out && (cp server/out/src/server.js out/server.js || true) && (cp -R server/out/src/* server/out/ || true)",
@@ -2007,7 +2352,9 @@
     "ci:release-gate": "node ./scripts/release-gate.mjs",
     "clean": "rimraf node_modules package-lock.json dist && npm ci",
     "audit:fix": "npm audit fix",
-    "test": "npm run build && node ./out/test/runTest.js"
+    "test": "npm run check:imports-sync && npm run build && node ./out/test/runTest.js",
+    "generate:imports": "node ./scripts/generate-vitte-imports.mjs",
+    "check:imports-sync": "node ./scripts/check-vitte-imports-sync.mjs"
   },
   "dependencies": {
     "azure-devops-node-api": "^11.2.0",

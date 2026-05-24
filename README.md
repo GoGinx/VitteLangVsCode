@@ -166,3 +166,48 @@ Command, view, and language activation are inferred by VS Code from `contributes
 Version history: `CHANGELOG.md`.
 
 License: MIT.
+
+## 13. Suggestions Engine (Local + AI Pipeline)
+
+The extension now ships a powerful suggestions stack with safe defaults.
+
+- Local inline engine (default path):
+  - repo-local indexing (`.vit/.vitte/.vitl`)
+  - n-gram + AST-lite patterns
+  - scope-aware, flow-aware and expected-value hints
+  - adaptive learning from accepted suggestions
+  - hot-context LRU cache for low latency
+
+- Optional AI pipeline:
+  - local RAG top-k chunks
+  - optional dedicated backend endpoint
+  - reranking + dedupe + syntax post-processing
+  - anti-hallucination filtering against known symbols
+  - enriched context from diagnostics/build/test/git/dependencies
+
+### Security defaults
+
+- Cloud opt-in: **off**
+- Local-only mode: **on**
+- Trusted workspace only: **on**
+- Secret redaction: **on**
+- External training declaration: **off**
+
+Use:
+- `Vitte: Suggestions Cloud Opt-In`
+- `Vitte: Suggestions Cloud Opt-Out (Local-Only)`
+
+### Useful suggestion commands
+
+- `Vitte: Inline Toggle`
+- `Vitte: Suggestions Refresh Context`
+- `Vitte: Suggestions Open Profiler`
+- `Vitte: Suggestions Show Local Engine Stats`
+- `Vitte: Suggestions Profile Resources`
+- `Vitte: Suggestions Export Diagnostics`
+
+### Key settings
+
+- `vitte.suggestions.granularity`: `classic_only` | `inline_only` | `hybrid`
+- `vitte.suggestions.localEngine.*` (local ranking, cache, multiline, adaptive learning)
+- `vitte.suggestions.aiPipeline.*` (backend, RAG, privacy, worker indexing, prompt cache)

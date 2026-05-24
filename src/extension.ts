@@ -62,6 +62,8 @@ import {
   getCompletionContextKey,
   getCompletionDocumentKey,
 } from "./utils/suggestions";
+import { LocalInlineEngine, type LocalInlineEngineOptions } from "./utils/localInlineEngine";
+import { AiInlinePipeline, type AiInlinePipelineOptions } from "./utils/aiInlinePipeline";
 
 let client: LanguageClient | undefined;
 let output: vscode.OutputChannel;
@@ -115,6 +117,15 @@ let completionNextInvokeIsAutoRefresh = false;
 let completionLoadNextPageKey: string | undefined;
 let completionLoadNextPageIssuedAt = 0;
 const completionTop1StableByKey = new Map<string, { text: string; count: number; lastAt: number }>();
+const inlineCompletionCache = new Map<string, { items: vscode.InlineCompletionItem[]; ts: number }>();
+const inlineNextEditBoostByDoc = new Map<string, number>();
+const inlineSuggestionCycleByKey = new Map<string, number>();
+const inlineTopCandidateByDoc = new Map<string, { line: number; character: number; left: string; text: string; at: number }>();
+const INLINE_CACHE_TTL_MS = 150;
+let localInlineEngine: LocalInlineEngine | undefined;
+let aiInlinePipeline: AiInlinePipeline | undefined;
+const localInlineReindexTimers = new Map<string, NodeJS.Timeout>();
+let suggestionEngineModeSuffix = "local";
 let completionIdlePrefetchTimer: NodeJS.Timeout | undefined;
 let completionPrefetchInFlight = false;
 let completionPrefetchExpectedKey: string | undefined;
@@ -486,6 +497,7 @@ function clearSetByUriPrefix(
 
 function invalidateCompletionCachesForDocument(document: vscode.TextDocument): void {
   const uriPrefix = `${document.uri.toString()}#`;
+  const inlinePrefix = `${document.uri.toString()}::`;
   clearCacheMapByUriPrefix(completionStreamingCachePrefix, uriPrefix);
   clearCacheMapByUriPrefix(completionStreamingCacheContext, uriPrefix);
   clearCacheMapByUriPrefix(completionStreamingCacheDocument, uriPrefix);
@@ -495,6 +507,9 @@ function invalidateCompletionCachesForDocument(document: vscode.TextDocument): v
   clearCacheMapByUriPrefix(completionRequestStartedAt, uriPrefix);
   clearCacheMapByUriPrefix(completionRequestRefreshed, uriPrefix);
   clearCacheMapByUriPrefix(completionTraceActiveByKey, uriPrefix);
+  clearCacheMapByUriPrefix(inlineCompletionCache, inlinePrefix);
+  clearCacheMapByUriPrefix(inlineSuggestionCycleByKey, inlinePrefix);
+  inlineNextEditBoostByDoc.delete(document.uri.toString());
   clearSetByUriPrefix(completionFirstUsableMarked, uriPrefix);
 }
 
@@ -507,6 +522,9 @@ function resetSuggestionRuntimeState(): void {
   completionLoadNextPageKey = undefined;
   completionLoadNextPageIssuedAt = 0;
   completionTop1StableByKey.clear();
+  inlineCompletionCache.clear();
+  inlineSuggestionCycleByKey.clear();
+  inlineNextEditBoostByDoc.clear();
   completionStickyAcceptedByDoc.clear();
   completionLspNegativeCache.clear();
   completionRequestStartedAt.clear();
@@ -702,6 +720,8 @@ function escapeHtml(input: string): string {
 
 function renderSuggestionProfilerHtml(): string {
   const rows = getSuggestionTraceHistory(80).reverse();
+  const localStats = localInlineEngine?.getStats();
+  const aiStats = aiInlinePipeline?.getTelemetry();
   const body = rows.length === 0
     ? `<tr><td colspan="11">No suggestion request captured yet.</td></tr>`
     : rows.map((r) => {
@@ -726,6 +746,31 @@ function renderSuggestionProfilerHtml(): string {
         <td>${escapeHtml(strict)}</td>
       </tr>`;
     }).join("");
+  const localStatsHtml = !localStats
+    ? `<div class="muted">Local inline engine stats: unavailable.</div>`
+    : `<div class="cards">
+        <div class="card"><div class="k">Local Requests</div><div class="v">${localStats.requests}</div></div>
+        <div class="card"><div class="k">Cache Hit Rate</div><div class="v">${(localStats.cacheHitRate * 100).toFixed(1)}%</div></div>
+        <div class="card"><div class="k">Local P50</div><div class="v">${localStats.latencyP50Ms}ms</div></div>
+        <div class="card"><div class="k">Local P95</div><div class="v">${localStats.latencyP95Ms}ms</div></div>
+        <div class="card"><div class="k">Indexed Files</div><div class="v">${localStats.indexedFiles}</div></div>
+        <div class="card"><div class="k">Learned Contexts</div><div class="v">${localStats.acceptanceContexts}</div></div>
+        <div class="card"><div class="k">Learned Entries</div><div class="v">${localStats.acceptanceEntries}</div></div>
+        <div class="card"><div class="k">Hot Cache Entries</div><div class="v">${localStats.hotCacheEntries}</div></div>
+      </div>`;
+  const aiStatsHtml = !aiStats
+    ? `<div class="muted">AI pipeline stats: unavailable.</div>`
+    : `<div class="cards">
+        <div class="card"><div class="k">AI Requests</div><div class="v">${aiStats.requests}</div></div>
+        <div class="card"><div class="k">Backend Req</div><div class="v">${aiStats.backendRequests}</div></div>
+        <div class="card"><div class="k">Backend Fail</div><div class="v">${aiStats.backendFailures}</div></div>
+        <div class="card"><div class="k">Timeouts</div><div class="v">${aiStats.backendTimeouts}</div></div>
+        <div class="card"><div class="k">Fallback Local</div><div class="v">${aiStats.fallbackLocalCount}</div></div>
+        <div class="card"><div class="k">AI Avg/P95</div><div class="v">${aiStats.avgLatencyMs}/${aiStats.p95LatencyMs}ms</div></div>
+        <div class="card"><div class="k">CPU Avg/P95</div><div class="v">${aiStats.avgCpuMicros}/${aiStats.p95CpuMicros}us</div></div>
+        <div class="card"><div class="k">MemΔ Avg/P95</div><div class="v">${aiStats.avgMemDeltaKb}/${aiStats.p95MemDeltaKb}KB</div></div>
+        <div class="card"><div class="k">RAG Chunks</div><div class="v">${aiStats.chunks}</div></div>
+      </div>`;
   return `<!doctype html>
 <html>
 <head>
@@ -735,6 +780,10 @@ function renderSuggestionProfilerHtml(): string {
     body { font-family: var(--vscode-font-family); font-size: 12px; margin: 12px; color: var(--vscode-foreground); background: var(--vscode-editor-background); }
     h2 { margin: 0 0 10px 0; font-size: 14px; }
     .muted { opacity: .8; margin-bottom: 10px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin: 10px 0 12px 0; }
+    .card { border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 6px 8px; background: var(--vscode-editorWidget-background); }
+    .k { opacity: .8; font-size: 11px; }
+    .v { font-size: 14px; font-weight: 600; margin-top: 3px; }
     table { border-collapse: collapse; width: 100%; table-layout: fixed; }
     th, td { border: 1px solid var(--vscode-panel-border); padding: 4px 6px; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     th { position: sticky; top: 0; background: var(--vscode-sideBar-background); z-index: 1; }
@@ -743,6 +792,8 @@ function renderSuggestionProfilerHtml(): string {
 <body>
   <h2>Vitte Suggestion Profiler</h2>
   <div class="muted">Timeline per request: first paint, enrich, first usable, stability, refresh cause, fallback cause.</div>
+  ${localStatsHtml}
+  ${aiStatsHtml}
   <table>
     <thead>
       <tr>
@@ -883,6 +934,155 @@ function percentileLocal(values: number[], q: number): number {
   const xs = [...values].sort((a, b) => a - b);
   const i = Math.max(0, Math.min(xs.length - 1, Math.round((xs.length - 1) * q)));
   return xs[i] ?? 0;
+}
+
+function inlineHeuristicCandidate(document: vscode.TextDocument, position: vscode.Position): string | undefined {
+  const line = document.lineAt(position.line).text;
+  const left = line.slice(0, position.character).trim();
+  if (/^if\s+[^{]*$/.test(left)) return " {\n\t\n}";
+  if (/^for\s+[^{]*$/.test(left)) return " {\n\t\n}";
+  if (/^while\s+[^{]*$/.test(left)) return " {\n\t\n}";
+  if (/^match\s+[^{]*$/.test(left)) return " {\n\t_ => \n}";
+  if (/^(proc|fn)\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*$/.test(left)) return " {\n\t\n}";
+  if (/^test\s+\"[^\"]*\"\s*$/.test(left)) return " {\n\t\n}";
+  return undefined;
+}
+
+function inlineNextEditCandidate(document: vscode.TextDocument, position: vscode.Position): string | undefined {
+  const current = document.lineAt(position.line).text.slice(0, position.character).trim();
+  if (/^(proc|fn)\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*$/.test(current)) return " {\n\t\n}";
+  if (current.endsWith("{")) return "\n\t\n}";
+  if (/;\s*$/.test(current)) {
+    for (let i = position.line; i >= Math.max(0, position.line - 20); i -= 1) {
+      const line = document.lineAt(i).text.trim();
+      const m = /\blet\s+([A-Za-z_][A-Za-z0-9_]*)\b/.exec(line);
+      if (m?.[1]) return `\nreturn ${m[1]};`;
+    }
+    return "\n";
+  }
+  return undefined;
+}
+
+function readLocalInlineEngineOptions(): LocalInlineEngineOptions {
+  const cfg = vscode.workspace.getConfiguration("vitte");
+  return {
+    enabled: cfg.get<boolean>("suggestions.localEngine.enabled", true),
+    maxFiles: Math.max(50, Math.min(50000, cfg.get<number>("suggestions.localEngine.maxFiles", 6000))),
+    maxFileSizeKB: Math.max(16, Math.min(8192, cfg.get<number>("suggestions.localEngine.maxFileSizeKB", 256))),
+    maxSuggestions: Math.max(1, Math.min(24, cfg.get<number>("suggestions.localEngine.inlineTopK", 8))),
+    reindexDebounceMs: Math.max(25, Math.min(3000, cfg.get<number>("suggestions.localEngine.reindexDebounceMs", 120))),
+    persistIndex: cfg.get<boolean>("suggestions.localEngine.persistIndex", true),
+    expectedValueHints: cfg.get<boolean>("suggestions.localEngine.expectedValueHints", true),
+    errorRecoveryHints: cfg.get<boolean>("suggestions.localEngine.errorRecoveryHints", true),
+    multilineEnabled: cfg.get<boolean>("suggestions.localEngine.multilineEnabled", true),
+    beamWidth: Math.max(2, Math.min(16, cfg.get<number>("suggestions.localEngine.beamWidth", 6))),
+    maxGeneratedTokens: Math.max(4, Math.min(64, cfg.get<number>("suggestions.localEngine.maxGeneratedTokens", 24))),
+    apiChainHints: cfg.get<boolean>("suggestions.localEngine.apiChainHints", true),
+    adaptiveLearning: cfg.get<boolean>("suggestions.localEngine.adaptiveLearning", true),
+    contextClassifierEnabled: cfg.get<boolean>("suggestions.localEngine.contextClassifierEnabled", true),
+    fastCacheEnabled: cfg.get<boolean>("suggestions.localEngine.fastCacheEnabled", true),
+    fastCacheSize: Math.max(32, Math.min(4096, cfg.get<number>("suggestions.localEngine.fastCacheSize", 512))),
+    fastCacheTtlMs: Math.max(20, Math.min(5000, cfg.get<number>("suggestions.localEngine.fastCacheTtlMs", 400))),
+  };
+}
+
+function readAiInlinePipelineOptions(): AiInlinePipelineOptions {
+  const cfg = vscode.workspace.getConfiguration("vitte");
+  return {
+    enabled: cfg.get<boolean>("suggestions.aiPipeline.enabled", false),
+    backendEnabled: cfg.get<boolean>("suggestions.aiPipeline.backendEnabled", false),
+    backendUrl: cfg.get<string>("suggestions.aiPipeline.backendUrl", ""),
+    backendTimeoutMs: Math.max(100, Math.min(10000, cfg.get<number>("suggestions.aiPipeline.backendTimeoutMs", 800))),
+    ragTopK: Math.max(1, Math.min(24, cfg.get<number>("suggestions.aiPipeline.ragTopK", 6))),
+    maxCandidates: Math.max(1, Math.min(16, cfg.get<number>("suggestions.aiPipeline.maxCandidates", 6))),
+    antiHallucination: cfg.get<boolean>("suggestions.aiPipeline.antiHallucination", true),
+    allowUnknownSymbols: cfg.get<boolean>("suggestions.aiPipeline.allowUnknownSymbols", false),
+    styleMode: cfg.get<"project" | "user">("suggestions.aiPipeline.styleMode", "project"),
+    userMode: cfg.get<"aggressive" | "balanced" | "conservative">("suggestions.aiPipeline.userMode", "balanced"),
+    granularity: cfg.get<"classic_only" | "inline_only" | "hybrid">("suggestions.granularity", "hybrid"),
+    privacyStrict: cfg.get<boolean>("suggestions.aiPipeline.privacyStrict", true),
+    backendAllowlist: cfg.get<string[]>("suggestions.aiPipeline.backendAllowlist", []),
+    redactSecrets: cfg.get<boolean>("suggestions.aiPipeline.redactSecrets", true),
+    trustedWorkspaceOnly: cfg.get<boolean>("suggestions.aiPipeline.trustedWorkspaceOnly", true),
+    cloudOptIn: cfg.get<boolean>("suggestions.aiPipeline.cloudOptIn", false),
+    localOnly: cfg.get<boolean>("suggestions.aiPipeline.localOnly", true),
+    dataRetentionDays: Math.max(0, Math.min(3650, cfg.get<number>("suggestions.aiPipeline.dataRetentionDays", 0))),
+    allowExternalTraining: cfg.get<boolean>("suggestions.aiPipeline.allowExternalTraining", false),
+    useWorkerIndexing: cfg.get<boolean>("suggestions.aiPipeline.useWorkerIndexing", true),
+    promptCacheEnabled: cfg.get<boolean>("suggestions.aiPipeline.promptCacheEnabled", true),
+    promptCacheTtlMs: Math.max(20, Math.min(5000, cfg.get<number>("suggestions.aiPipeline.promptCacheTtlMs", 400))),
+    promptCacheSize: Math.max(16, Math.min(4096, cfg.get<number>("suggestions.aiPipeline.promptCacheSize", 512))),
+  };
+}
+
+function updateSuggestionEngineModeSuffix(): void {
+  const cfg = vscode.workspace.getConfiguration("vitte");
+  const inline = cfg.get<boolean>("suggestions.ghostTextTop1Stable", true);
+  const ai = cfg.get<boolean>("suggestions.aiPipeline.enabled", false);
+  const backend = cfg.get<boolean>("suggestions.aiPipeline.backendEnabled", false);
+  const localOnly = cfg.get<boolean>("suggestions.aiPipeline.localOnly", true);
+  const cloudOptIn = cfg.get<boolean>("suggestions.aiPipeline.cloudOptIn", false);
+  if (!inline) suggestionEngineModeSuffix = "inline-off";
+  else if (localOnly) suggestionEngineModeSuffix = "local-only";
+  else if (ai && backend && !cloudOptIn) suggestionEngineModeSuffix = "cloud-locked";
+  else if (ai && backend) suggestionEngineModeSuffix = "cloud";
+  else if (ai) suggestionEngineModeSuffix = "hybrid-local";
+  else suggestionEngineModeSuffix = "local";
+  applyStatusBar();
+}
+
+async function ensureCloudOptInIfNeeded(): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration("vitte");
+  const enabled = cfg.get<boolean>("suggestions.aiPipeline.enabled", false);
+  const backend = cfg.get<boolean>("suggestions.aiPipeline.backendEnabled", false);
+  const localOnly = cfg.get<boolean>("suggestions.aiPipeline.localOnly", true);
+  const optIn = cfg.get<boolean>("suggestions.aiPipeline.cloudOptIn", false);
+  if (!enabled || !backend || localOnly || optIn) return;
+  const choice = await vscode.window.showWarningMessage(
+    "Vitte AI cloud backend is configured but disabled until explicit opt-in.",
+    "Enable Cloud",
+    "Keep Local-Only",
+  );
+  if (choice === "Enable Cloud") {
+    await cfg.update("suggestions.aiPipeline.cloudOptIn", true, vscode.ConfigurationTarget.Workspace);
+    await cfg.update("suggestions.aiPipeline.localOnly", false, vscode.ConfigurationTarget.Workspace);
+    updateSuggestionEngineModeSuffix();
+  }
+}
+
+function scheduleLocalInlineEngineUpdate(document: vscode.TextDocument): void {
+  if (!localInlineEngine) return;
+  if (!isVitteDocument(document)) return;
+  const key = document.uri.toString();
+  const prev = localInlineReindexTimers.get(key);
+  if (prev) clearTimeout(prev);
+  const waitMs = Math.max(25, Math.min(3000, readLocalInlineEngineOptions().reindexDebounceMs));
+  const timer = setTimeout(() => {
+    localInlineEngine?.upsertDocument(document);
+    void aiInlinePipeline?.upsert(document.uri.toString(), document.getText());
+    localInlineReindexTimers.delete(key);
+  }, waitMs);
+  localInlineReindexTimers.set(key, timer);
+}
+
+function dedupeInlineTexts(items: vscode.InlineCompletionItem[]): vscode.InlineCompletionItem[] {
+  const seen = new Set<string>();
+  const out: vscode.InlineCompletionItem[] = [];
+  for (const it of items) {
+    const text = typeof it.insertText === "string" ? it.insertText : it.insertText.value;
+    if (seen.has(text)) continue;
+    seen.add(text);
+    out.push(it);
+  }
+  return out;
+}
+
+function rotateInlineItems(items: vscode.InlineCompletionItem[], offset: number): vscode.InlineCompletionItem[] {
+  if (items.length <= 1) return items;
+  const n = items.length;
+  const k = ((offset % n) + n) % n;
+  if (k === 0) return items;
+  return [...items.slice(k), ...items.slice(0, k)];
 }
 
 function getStreamingCompletionStats(): {
@@ -1197,6 +1397,8 @@ const COMMAND_MENU_ENTRIES: readonly CommandMenuEntry[] = [
   { label: "Server log", description: "Open log output", command: "vitte.showServerLog" },
   { label: "Server metrics", description: "Show performance snapshot", command: "vitte.showServerMetrics" },
   { label: "Suggestions ▸ Load next page", description: "Increment completion page and refresh suggest", command: "vitte.suggestions.loadNextPage" },
+  { label: "Inline ▸ Next suggestion", description: "Cycle inline ghost suggestion candidates", command: "vitte.inline.nextSuggestion" },
+  { label: "Inline ▸ Next edit", description: "Prioritize next-edit inline ghost suggestion", command: "vitte.inline.nextEdit" },
   { label: "Suggestions ▸ Reset learning", description: "Clear local suggestion learning state", command: "vitte.suggestions.resetLearning" },
   { label: "Suggestions ▸ Export diagnostics", description: "Export suggestion diagnostics JSON snapshot", command: "vitte.suggestions.exportDiagnostics" },
   { label: "Suggestions ▸ Open profiler", description: "Open request timeline for suggestions", command: "vitte.suggestions.openProfiler" },
@@ -1285,6 +1487,9 @@ function applyStatusBar(): void {
 
   if (statusHealthIcon) {
     text = `${text} ${statusHealthIcon}`;
+  }
+  if (suggestionEngineModeSuffix) {
+    text = `${text} [${suggestionEngineModeSuffix}]`;
   }
   if (syntaxParsingInFlight > 0) {
     text = `${text} $(sync~spin)`;
@@ -1611,6 +1816,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
   refreshDiagnosticsStatus();
   statusItem.show();
   reportSettingsIssues(output, "activate");
+  localInlineEngine = new LocalInlineEngine(readLocalInlineEngineOptions());
+  await localInlineEngine.initialize(context);
+  aiInlinePipeline = new AiInlinePipeline(readAiInlinePipelineOptions());
+  await aiInlinePipeline.initialize();
+  void ensureCloudOptInIfNeeded();
+  updateSuggestionEngineModeSuffix();
   updateCommandButtons(context);
   void showStartupCommandPrompt(context);
   void setServerOnlineContext(false);
@@ -1654,6 +1865,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
     scheduleLiveSyntaxDiagnostics(doc, "open");
     completionOpenedAtByDoc.set(doc.uri.toString(), Date.now());
     scheduleAstCacheInvalidation(doc, false);
+    scheduleLocalInlineEngineUpdate(doc);
   }));
   context.subscriptions.push(vscode.workspace.onDidChangeTextDocument((e) => {
     const docKey = e.document.uri.toString();
@@ -1669,6 +1881,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
     updateEditorLint(e.document);
     scheduleLiveSyntaxDiagnostics(e.document, "change");
     scheduleAstCacheInvalidation(e.document, true);
+    scheduleLocalInlineEngineUpdate(e.document);
+    const cand = inlineTopCandidateByDoc.get(docKey);
+    if (cand && e.contentChanges.length > 0) {
+      const ch = e.contentChanges[0];
+      if (ch && ch.range.start.line === cand.line && ch.range.start.character === cand.character && ch.text.length > 0) {
+        const normalizedCandidate = cand.text.replace(/\r/g, "");
+        if (normalizedCandidate.startsWith(ch.text) || ch.text.startsWith(normalizedCandidate.slice(0, Math.min(normalizedCandidate.length, ch.text.length)))) {
+          localInlineEngine?.noteAccepted(cand.left, normalizedCandidate);
+          aiInlinePipeline?.noteAccepted();
+        }
+      }
+      if ((Date.now() - cand.at) > 5000 || e.contentChanges.length > 1) {
+        inlineTopCandidateByDoc.delete(docKey);
+      }
+    }
   }));
   context.subscriptions.push(vscode.workspace.onDidCloseTextDocument((doc) => {
     editorLintCollection?.delete(doc.uri);
@@ -1688,6 +1915,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
     completionOpenedAtByDoc.delete(key);
     typingSpeedByDoc.delete(key);
     completionStickyAcceptedByDoc.delete(key);
+    inlineTopCandidateByDoc.delete(key);
     invalidateCompletionCachesForDocument(doc);
     completionAstFingerprintByDoc.delete(key);
     const t = completionAstRefreshTimers.get(key);
@@ -1695,12 +1923,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
       clearTimeout(t);
       completionAstRefreshTimers.delete(key);
     }
+    localInlineEngine?.removeDocument(doc.uri);
+    aiInlinePipeline?.remove(doc.uri.toString());
+    const reindex = localInlineReindexTimers.get(key);
+    if (reindex) {
+      clearTimeout(reindex);
+      localInlineReindexTimers.delete(key);
+    }
   }));
   for (const doc of vscode.workspace.textDocuments) {
     updateEditorLint(doc);
     scheduleLiveSyntaxDiagnostics(doc, "open");
     completionOpenedAtByDoc.set(doc.uri.toString(), Date.now());
     scheduleAstCacheInvalidation(doc, false);
+    scheduleLocalInlineEngineUpdate(doc);
   }
 
   // Debug & runtime tooling
@@ -1911,6 +2147,52 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
       await vscode.commands.executeCommand("editor.action.triggerSuggest");
       vscode.window.setStatusBarMessage(`Vitte suggestions page: ${nextPage}/${maxPages}`, 1800);
     }),
+    vscode.commands.registerCommand("vitte.inline.nextSuggestion", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || !isVitteDocument(editor.document)) return;
+      const key = `${editor.document.uri.toString()}::${editor.selection.active.line}:${editor.selection.active.character}`;
+      const current = inlineSuggestionCycleByKey.get(key) ?? 0;
+      inlineSuggestionCycleByKey.set(key, current + 1);
+      await vscode.commands.executeCommand("editor.action.inlineSuggest.hide");
+      await vscode.commands.executeCommand("editor.action.inlineSuggest.trigger");
+      vscode.window.setStatusBarMessage("Vitte inline: next suggestion", 900);
+    }),
+    vscode.commands.registerCommand("vitte.inline.nextEdit", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || !isVitteDocument(editor.document)) return;
+      inlineNextEditBoostByDoc.set(editor.document.uri.toString(), Date.now() + 5000);
+      await vscode.commands.executeCommand("editor.action.inlineSuggest.trigger");
+      vscode.window.setStatusBarMessage("Vitte inline: next edit", 1200);
+    }),
+    vscode.commands.registerCommand("vitte.inline.toggle", async () => {
+      const cfg = vscode.workspace.getConfiguration("vitte");
+      const current = cfg.get<boolean>("suggestions.ghostTextTop1Stable", true);
+      await cfg.update("suggestions.ghostTextTop1Stable", !current, vscode.ConfigurationTarget.Workspace);
+      updateSuggestionEngineModeSuffix();
+      void vscode.window.showInformationMessage(`Vitte inline suggestions: ${!current ? "enabled" : "disabled"}.`);
+    }),
+    vscode.commands.registerCommand("vitte.suggestions.refreshContext", async () => {
+      await aiInlinePipeline?.refreshWorkspaceContext();
+      for (const doc of vscode.workspace.textDocuments) {
+        if (!isVitteDocument(doc)) continue;
+        void aiInlinePipeline?.upsert(doc.uri.toString(), doc.getText());
+      }
+      void vscode.window.showInformationMessage("Vitte suggestions context refreshed.");
+    }),
+    vscode.commands.registerCommand("vitte.suggestions.cloudOptIn", async () => {
+      const cfg = vscode.workspace.getConfiguration("vitte");
+      await cfg.update("suggestions.aiPipeline.cloudOptIn", true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update("suggestions.aiPipeline.localOnly", false, vscode.ConfigurationTarget.Workspace);
+      updateSuggestionEngineModeSuffix();
+      void vscode.window.showInformationMessage("Vitte AI cloud opt-in enabled.");
+    }),
+    vscode.commands.registerCommand("vitte.suggestions.cloudOptOut", async () => {
+      const cfg = vscode.workspace.getConfiguration("vitte");
+      await cfg.update("suggestions.aiPipeline.cloudOptIn", false, vscode.ConfigurationTarget.Workspace);
+      await cfg.update("suggestions.aiPipeline.localOnly", true, vscode.ConfigurationTarget.Workspace);
+      updateSuggestionEngineModeSuffix();
+      void vscode.window.showInformationMessage("Vitte switched to local-only mode.");
+    }),
     vscode.commands.registerCommand("vitte.suggestions.resetLearning", async () => {
       resetSuggestionLearningState();
       resetSuggestionRuntimeState();
@@ -1929,6 +2211,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
           ts: new Date().toISOString(),
           workspace: workspaceDir,
           streaming: getStreamingCompletionStats(),
+          localInlineEngine: localInlineEngine?.getStats() ?? null,
+          aiInlinePipeline: aiInlinePipeline?.getTelemetry() ?? null,
           profilerRecent: getSuggestionTraceHistory(120),
           learning: getSuggestionLearningSnapshot(),
           config: {
@@ -1955,6 +2239,40 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
         const message = err instanceof Error ? err.message : String(err);
         void vscode.window.showErrorMessage(`Vitte: failed to export suggestions diagnostics (${message})`);
       }
+    }),
+    vscode.commands.registerCommand("vitte.suggestions.showLocalEngineStats", async () => {
+      const s = localInlineEngine?.getStats();
+      if (!s) {
+        void vscode.window.showInformationMessage("Vitte local inline engine: not initialized.");
+        return;
+      }
+      const msg = [
+        `requests=${s.requests}`,
+        `cacheHitRate=${(s.cacheHitRate * 100).toFixed(1)}%`,
+        `p50=${s.latencyP50Ms}ms`,
+        `p95=${s.latencyP95Ms}ms`,
+        `indexedFiles=${s.indexedFiles}`,
+        `learnedContexts=${s.acceptanceContexts}`,
+        `learnedEntries=${s.acceptanceEntries}`,
+        `hotCacheEntries=${s.hotCacheEntries}`,
+      ].join(" | ");
+      void vscode.window.showInformationMessage(`Vitte local engine stats: ${msg}`);
+    }),
+    vscode.commands.registerCommand("vitte.suggestions.profileResources", async () => {
+      const ai = aiInlinePipeline?.getTelemetry();
+      const mem = process.memoryUsage();
+      if (!ai) {
+        void vscode.window.showInformationMessage("Vitte AI pipeline profiler: unavailable.");
+        return;
+      }
+      const msg = [
+        `aiReq=${ai.requests}`,
+        `aiAvg/P95=${ai.avgLatencyMs}/${ai.p95LatencyMs}ms`,
+        `cpuAvg/P95=${ai.avgCpuMicros}/${ai.p95CpuMicros}us`,
+        `memDeltaAvg/P95=${ai.avgMemDeltaKb}/${ai.p95MemDeltaKb}KB`,
+        `rss=${Math.round(mem.rss / (1024 * 1024))}MB`,
+      ].join(" | ");
+      void vscode.window.showInformationMessage(`Vitte suggestions resources: ${msg}`);
     }),
     vscode.commands.registerCommand("vitte.suggestions.openProfiler", () => {
       openSuggestionProfilerPanel(context);
@@ -2249,34 +2567,80 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
   context.subscriptions.push(vscode.languages.registerInlineCompletionItemProvider(
     LANGUAGES.map((id) => ({ language: id, scheme: "file" })),
     {
-      provideInlineCompletionItems(
+      async provideInlineCompletionItems(
         document: vscode.TextDocument,
         position: vscode.Position,
         _ctx: vscode.InlineCompletionContext,
         _token: vscode.CancellationToken,
-      ): vscode.ProviderResult<vscode.InlineCompletionItem[] | vscode.InlineCompletionList> {
+      ): Promise<vscode.InlineCompletionItem[] | vscode.InlineCompletionList> {
+        const started = Date.now();
         const cfg = vscode.workspace.getConfiguration("vitte");
         const enabled = cfg.get<boolean>("suggestions.ghostTextTop1Stable", true);
         if (!enabled) return [];
+        const cacheTtlMs = Math.max(50, Math.min(1000, cfg.get<number>("suggestions.inlineCacheTtlMs", INLINE_CACHE_TTL_MS)));
+        const key = `${document.uri.toString()}::${position.line}:${position.character}`;
+        const cached = inlineCompletionCache.get(key);
+        if (cached && (Date.now() - cached.ts) <= cacheTtlMs) {
+          return cached.items;
+        }
+
         const threshold = Math.max(1, Math.min(8, cfg.get<number>("suggestions.ghostTextStableThreshold", 2)));
         const maxAgeMs = Math.max(200, Math.min(10000, cfg.get<number>("suggestions.ghostTextMaxAgeMs", 2500)));
-        const key = getCompletionRequestKey(document, position);
-        const candidate = completionTop1StableByKey.get(key);
-        if (!candidate) return [];
-        if (candidate.count < threshold) return [];
-        if ((Date.now() - candidate.lastAt) > maxAgeMs) return [];
+        const requestKey = getCompletionRequestKey(document, position);
+        const candidate = completionTop1StableByKey.get(requestKey);
+        const items: vscode.InlineCompletionItem[] = [];
+        const nextEditUntil = inlineNextEditBoostByDoc.get(document.uri.toString()) ?? 0;
 
-        const wordRange = document.getWordRangeAtPosition(position);
-        const prefix = wordRange ? document.getText(wordRange) : "";
-        if (prefix.length > 0) {
+        if (candidate && candidate.count >= threshold && (Date.now() - candidate.lastAt) <= maxAgeMs) {
+          const wordRange = document.getWordRangeAtPosition(position);
+          const prefix = wordRange ? document.getText(wordRange) : "";
           const lhs = candidate.text.toLowerCase();
           const rhs = prefix.toLowerCase();
-          if (!lhs.startsWith(rhs)) return [];
-          if (lhs === rhs) return [];
+          if (prefix.length === 0 || (lhs.startsWith(rhs) && lhs !== rhs)) {
+            items.push(new vscode.InlineCompletionItem(candidate.text, wordRange ?? new vscode.Range(position, position)));
+          }
         }
-        const range = wordRange ?? new vscode.Range(position, position);
-        const item = new vscode.InlineCompletionItem(candidate.text, range);
-        return [item];
+
+        if (Date.now() <= nextEditUntil) {
+          const nextEdit = inlineNextEditCandidate(document, position);
+          if (nextEdit) {
+            items.unshift(new vscode.InlineCompletionItem(nextEdit, new vscode.Range(position, position)));
+          }
+        }
+
+        const heuristic = inlineHeuristicCandidate(document, position);
+        if (heuristic) {
+          items.push(new vscode.InlineCompletionItem(heuristic, new vscode.Range(position, position)));
+        }
+        const localInlineTopK = Math.max(1, Math.min(24, cfg.get<number>("suggestions.localEngine.inlineTopK", 8)));
+        const preferMultiline = Date.now() <= nextEditUntil;
+        const localCandidates = localInlineEngine?.suggest(document, position, localInlineTopK, { preferMultiline }) ?? [];
+        const aiCandidates = await (aiInlinePipeline?.suggest(document, position, localCandidates) ?? Promise.resolve(localCandidates));
+        for (const suggestion of aiCandidates) {
+          items.push(new vscode.InlineCompletionItem(suggestion, new vscode.Range(position, position)));
+        }
+
+        const deduped = dedupeInlineTexts(items).slice(0, 4);
+        const cycle = inlineSuggestionCycleByKey.get(key) ?? 0;
+        const finalItems = rotateInlineItems(deduped, cycle);
+        if (finalItems.length > 0) {
+          const top = finalItems[0];
+          const topText = typeof top.insertText === "string" ? top.insertText : top.insertText.value;
+          const docKey = document.uri.toString();
+          inlineTopCandidateByDoc.set(docKey, {
+            line: position.line,
+            character: position.character,
+            left: document.lineAt(position.line).text.slice(0, position.character),
+            text: topText,
+            at: Date.now(),
+          });
+        }
+        inlineCompletionCache.set(key, { items: finalItems, ts: Date.now() });
+        const elapsed = Date.now() - started;
+        if (elapsed > 150) {
+          obsLog("inline.latency.local.slow", "warn", { elapsedMs: elapsed, targetMs: 150 });
+        }
+        return finalItems;
       },
     },
   ));
@@ -2309,6 +2673,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
     }
     if (e.affectsConfiguration("vitte.syntax.liveDiagnostics") || e.affectsConfiguration("vitte.lang")) {
       for (const doc of vscode.workspace.textDocuments) scheduleLiveSyntaxDiagnostics(doc, "config");
+    }
+    if (e.affectsConfiguration("vitte.suggestions.localEngine")) {
+      localInlineEngine?.dispose();
+      localInlineEngine = new LocalInlineEngine(readLocalInlineEngineOptions());
+      void localInlineEngine.initialize(context);
+      for (const doc of vscode.workspace.textDocuments) {
+        scheduleLocalInlineEngineUpdate(doc);
+      }
+    }
+    if (e.affectsConfiguration("vitte.suggestions.aiPipeline")) {
+      aiInlinePipeline?.dispose();
+      aiInlinePipeline = new AiInlinePipeline(readAiInlinePipelineOptions());
+      void aiInlinePipeline.initialize();
+      for (const doc of vscode.workspace.textDocuments) {
+        if (isVitteDocument(doc)) void aiInlinePipeline.upsert(doc.uri.toString(), doc.getText());
+      }
+      updateSuggestionEngineModeSuffix();
+    }
+    if (e.affectsConfiguration("vitte.suggestions.ghostTextTop1Stable") || e.affectsConfiguration("vitte.suggestions.granularity")) {
+      updateSuggestionEngineModeSuffix();
     }
   }));
 
@@ -2357,6 +2741,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Extens
   }));
   context.subscriptions.push(vscode.workspace.onDidSaveTextDocument((doc) => {
     scheduleLiveSyntaxDiagnostics(doc, "save");
+    scheduleLocalInlineEngineUpdate(doc);
   }));
 
   if (isOfflineEnabled()) {
@@ -2415,6 +2800,17 @@ export async function deactivate(): Promise<void> {
     clearTimeout(completionIdlePrefetchTimer);
     completionIdlePrefetchTimer = undefined;
   }
+  for (const timer of localInlineReindexTimers.values()) {
+    try { clearTimeout(timer); } catch { /* noop */ }
+  }
+  localInlineReindexTimers.clear();
+  if (localInlineEngine) {
+    try { await localInlineEngine.persistNow(); } catch { /* noop */ }
+    localInlineEngine.dispose();
+    localInlineEngine = undefined;
+  }
+  aiInlinePipeline?.dispose();
+  aiInlinePipeline = undefined;
   for (const timer of completionAstRefreshTimers.values()) {
     try { clearTimeout(timer); } catch { /* noop */ }
   }

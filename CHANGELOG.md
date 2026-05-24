@@ -5,6 +5,74 @@ and adheres to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [2.1.2] — 2026-05-24
+### Added
+- 🧠 **Local inline engine v2** (repo-local) with:
+  - n-gram token modeling (uni/bi/tri-gram)
+  - AST-lite patterns (`if/for/while/match/fn/proc/test/let`)
+  - local scope-sensitive suggestions
+  - flow hints (`x != null`)
+  - expected-value hints (`bool/string/number/enum-like`)
+  - multi-line block continuations
+  - learned API chain continuations
+- 💾 **Persistent local index** for inline quality and warm restarts.
+- 🔁 **Adaptive inline learning** from accepted suggestions (context-based reranking).
+- ⚡ **Fast hot-context cache** (LRU + TTL) for sub-150ms local path.
+- 🧭 **Context classifier** for inline ranking strategies (`declaration/call/member/guard/return/test`).
+- 📊 **Local suggestion profiler metrics**:
+  - cache hit-rate
+  - p50/p95 latency
+  - indexed files
+  - learned contexts/entries
+  - hot cache occupancy
+- 🤖 **AI inline pipeline module** (`aiInlinePipeline.ts`):
+  - optional dedicated backend calls
+  - local RAG chunk retrieval (top-k)
+  - candidate dedupe, reranking, syntax post-processing
+  - anti-hallucination filtering (known symbols preferred)
+  - diagnostics/build/test/git/dependency-aware context enrichment
+- 🔒 **Security & privacy controls**:
+  - explicit cloud opt-in
+  - local-only mode
+  - strict backend allowlist mode
+  - trusted workspace gating
+  - secret redaction before backend prompt
+  - retention/training policy metadata
+- 🧵 **Worker indexing path** for AI chunk parsing/indexing (`aiIndexWorker.ts`) with timeout fallback.
+- 🧪 **Resource profiling command**:
+  - `Vitte: Suggestions Profile Resources`
+  - AI avg/p95 latency + CPU + memory deltas
+- 🧩 **New commands**:
+  - `Vitte: Inline Toggle`
+  - `Vitte: Suggestions Refresh Context`
+  - `Vitte: Suggestions Cloud Opt-In`
+  - `Vitte: Suggestions Cloud Opt-Out (Local-Only)`
+  - `Vitte: Suggestions Show Local Engine Stats`
+  - `Vitte: Suggestions Profile Resources`
+- 📄 **Security documentation**:
+  - `SECURITY.md`
+  - `PRIVACY.md`
+
+### Changed
+- 🪧 **Status bar engine mode** now shows suggestion engine state:
+  - `local`
+  - `local-only`
+  - `hybrid-local`
+  - `cloud`
+  - `cloud-locked`
+  - `inline-off`
+- 🧾 **Suggestions diagnostics export** now includes:
+  - local engine metrics
+  - AI pipeline telemetry
+- 🖥️ **Suggestion profiler webview** now includes local and AI cards (live).
+
+### Notes
+- Cloud backend is **disabled by default**.
+- Local-only mode is **enabled by default**.
+- Secret redaction is **enabled by default**.
+
+---
+
 ## [2.1.1] — 2026-02-12
 ### Added
 - 📴 **Offline permanent**: force offline mode with `vitte.server.offlinePermanent` (no auto-retry).

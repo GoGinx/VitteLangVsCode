@@ -6,17 +6,17 @@
 
 // 🟩 Mots-clés de base (réservés au niveau grammaire)
 export const KEYWORDS = [
-  "space", "module", "import", "use", "export", "pub",
-  "program", "service", "kernel", "driver", "tool", "scenario", "pipeline",
-  "struct", "enum", "union", "typedef", "type", "form",
-  "fn", "proc", "extern", "inline", "static",
+  "space", "module", "use", "pull", "pub", "unsafe",
+  "struct", "enum", "union", "type", "form", "pick", "flags", "trait", "impl",
+  "proc", "extern", "inline", "static",
   "let", "mut", "const",
-  "as", "where",
+  "as", "where", "dyn",
   "if", "elif", "else", "while", "for", "in", "loop", "match",
   "break", "continue", "return", "give",
-  "and", "or", "not",
-  "mod", "field", "set", "say", "do", "ret", "when", "scn", "prog",
-  "from", "to", "step",
+  "and", "or", "not", "is",
+  "entry", "at", "share", "test", "bench",
+  "mod", "field", "set", "say", "do", "ret", "when",
+  "from", "to", "step", "await", "try",
 ] as const;
 export type Keyword = typeof KEYWORDS[number];
 

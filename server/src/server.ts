@@ -60,7 +60,7 @@ import type {
 import { TextDocument } from "vscode-languageserver-textdocument";
 
 /* Modules internes */
-import { provideCompletions, resolveCompletion, triggerCharacters } from "./completion.js";
+import { provideCompletions, resolveCompletion, triggerCharacters, configureCompletions } from "./completion.js";
 import {
   documentSymbols,
   definitionAtPosition,
@@ -147,6 +147,13 @@ interface ServerSettings {
     returnHints?: boolean;
     aliasHints?: boolean;
   };
+  completion: {
+    enabledInComments?: boolean;
+    enabledInStrings?: boolean;
+    includeSnippets?: boolean;
+    workspaceSymbols?: boolean;
+    maxItems?: number;
+  };
   features: {
     completion: boolean;
     hover: boolean;
@@ -179,6 +186,13 @@ const DEFAULT_SETTINGS: ServerSettings = {
     typeHints: true,
     returnHints: true,
     aliasHints: true,
+  },
+  completion: {
+    enabledInComments: false,
+    enabledInStrings: false,
+    includeSnippets: true,
+    workspaceSymbols: true,
+    maxItems: 200,
   },
   features: {
     completion: true,
@@ -381,10 +395,16 @@ async function applyConfiguration(): Promise<void> {
     try {
       const cfg = await workspace.getConfiguration({ section: "vitte" }) as Partial<ServerSettings> | null | undefined;
       const lintCfg = await workspace.getConfiguration({ section: "vitte.lint" }) as Partial<ServerSettings["lint"]> | null | undefined;
+      const completionCfg = await workspace.getConfiguration({ section: "vitte.completion" }) as Partial<ServerSettings["completion"]> | null | undefined;
       const merged: ServerSettings = { ...DEFAULT_SETTINGS, ...(cfg ?? {}) };
       merged.lint = { ...DEFAULT_SETTINGS.lint, ...(lintCfg ?? {}) };
       merged.features = { ...DEFAULT_SETTINGS.features, ...(cfg?.features ?? {}) };
       merged.inlayHints = { ...DEFAULT_SETTINGS.inlayHints, ...(cfg?.inlayHints ?? {}) };
+      merged.completion = {
+        ...DEFAULT_SETTINGS.completion,
+        ...(cfg?.completion ?? {}),
+        ...(completionCfg ?? {}),
+      };
       merged.lintDebounceMs = clampNumber(merged.lintDebounceMs, 0, 2000, DEFAULT_SETTINGS.lintDebounceMs);
       merged.maxFileSizeKB = clampNumber(merged.maxFileSizeKB, 64, 10000, DEFAULT_SETTINGS.maxFileSizeKB);
       merged.requestTimeoutMs = clampNumber(merged.requestTimeoutMs, 100, 5000, DEFAULT_SETTINGS.requestTimeoutMs);
@@ -394,11 +414,14 @@ async function applyConfiguration(): Promise<void> {
       merged.indexerCacheEnabled = cfg?.indexerCacheEnabled ?? DEFAULT_SETTINGS.indexerCacheEnabled;
       merged.requestTimeouts = { ...DEFAULT_SETTINGS.requestTimeouts, ...(cfg?.requestTimeouts ?? {}) };
       globalSettings = merged;
+      configureCompletions(globalSettings.completion);
     } catch {
       globalSettings = { ...DEFAULT_SETTINGS };
+      configureCompletions(globalSettings.completion);
     }
   } else {
     globalSettings = { ...DEFAULT_SETTINGS };
+    configureCompletions(globalSettings.completion);
   }
   for (const doc of documents.all()) scheduleLint(doc);
 }
